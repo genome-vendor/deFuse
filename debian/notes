@@ -1,0 +1,8 @@
+zlib
+boost
+samtools
+libtclap-dev
+libsparsehash-dev
+bioperl
+r-base
+libbam-dev
