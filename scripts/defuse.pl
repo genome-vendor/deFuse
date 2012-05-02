@@ -1,0 +1,632 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings FATAL => 'all';
+use Getopt::Std;
+use Getopt::Long;
+use File::Basename;
+use Cwd qw[abs_path];
+use File::Spec;
+
+use lib dirname($0);
+use configdata;
+use cmdrunner;
+use parsers;
+
+my @usage;
+push @usage, "Usage: ".basename($0)." [options]\n";
+push @usage, "Run the defuse pipeline for fusion discovery.\n";
+push @usage, "  -h, --help      Displays this information\n";
+push @usage, "  -c, --config    Configuration Filename\n";
+push @usage, "  -o, --output    Output Directory\n";
+push @usage, "  -d, --data      Source Data Directory (default: Skip data retrieval)\n";
+push @usage, "  -n, --name      Library Name (default: Output Directory Suffix)\n";
+push @usage, "  -l, --local     Job Local Directory (default: Output Directory)\n";
+push @usage, "  -s, --submit    Submitter Type (default: direct)\n";
+push @usage, "  -p, --parallel  Maximum Number of Parallel Jobs (default: 1)\n";
+
+my $help;
+my $config_filename;
+my $source_directory;
+my $output_directory;
+my $library_name;
+my $joblocal_directory;
+my $submitter_type;
+my $max_parallel;
+
+GetOptions
+(
+	'help'        => \$help,
+	'config=s'    => \$config_filename,
+	'data=s'      => \$source_directory,
+	'output=s'    => \$output_directory,
+	'name=s'      => \$library_name,
+	'local=s'     => \$joblocal_directory,
+	'submit=s'    => \$submitter_type,
+	'parallel=s'  => \$max_parallel,
+);
+
+not defined $help or die @usage;
+
+defined $config_filename or die @usage;
+defined $output_directory or die @usage;
+
+mkdir $output_directory if not -d $output_directory;
+-e $config_filename or die "Error: Unable to find config file $config_filename\n";
+
+$output_directory = abs_path($output_directory);
+$config_filename = abs_path($config_filename);
+
+# Guess library name
+if (not defined $library_name)
+{
+	$library_name = "";
+	my @output_splitdir = File::Spec->splitdir($output_directory);
+	while ($library_name eq "" and scalar @output_splitdir > 0)
+	{
+		$library_name = pop(@output_splitdir);
+	}
+	defined $library_name or die "Error: Unable to infer library name from output director $output_directory\n";
+}
+
+# Job local directory defaults to temp subdirectory of output directory
+if (not defined $joblocal_directory)
+{
+	$joblocal_directory = $output_directory."/tmp";
+	mkdir $joblocal_directory if not -d $joblocal_directory;
+}
+
+# Submitter type defaults to direct
+if (not defined $submitter_type)
+{
+	$submitter_type = "direct";
+}
+
+# Max parallel defaults to 1 for direct submitter
+if (not defined $max_parallel)
+{
+	if ($submitter_type eq "direct")
+	{
+		$max_parallel = 1;
+	}
+	else
+	{
+		$max_parallel = 200;
+	}
+}
+
+my $config = configdata->new();
+$config->read($config_filename);
+
+# Config values
+my $gene_models           = $config->get_value("gene_models");
+my $genome_fasta          = $config->get_value("genome_fasta");
+my $chromosome_prefix     = $config->get_value("chromosome_prefix");
+my $reference_fasta       = $config->get_value("reference_fasta");
+my $cdna_fasta            = $config->get_value("cdna_fasta");
+my $cdna_regions          = $config->get_value("cdna_regions");
+my $exons_fasta           = $config->get_value("exons_fasta");
+my $cds_fasta             = $config->get_value("cds_fasta");
+my $rrna_fasta            = $config->get_value("rrna_fasta");
+my $est_fasta             = $config->get_value("est_fasta");
+my @est_split_fastas      = $config->get_list("est_split_fasta");
+my $ig_gene_list          = $config->get_value("ig_gene_list");
+my $max_insert_size       = $config->get_value("max_insert_size");
+my $span_count_threshold  = $config->get_value("span_count_threshold");
+my $probability_threshold = $config->get_value("probability_threshold");
+my $clustering_precision  = $config->get_value("clustering_precision");
+my $scripts_directory     = $config->get_value("scripts_directory");
+my $tools_directory       = $config->get_value("tools_directory");
+my $reads_per_job         = $config->get_value("reads_per_job");
+my $regions_per_job       = $config->get_value("regions_per_job");
+my $samtools_bin          = $config->get_value("samtools_bin");
+my $rscript_bin           = $config->get_value("rscript_bin");
+my $split_min_anchor      = $config->get_value("split_min_anchor");
+my $cov_samp_density      = $config->get_value("covariance_sampling_density");
+my $denovo_assembly       = $config->get_value("denovo_assembly");
+my $remove_job_files      = $config->get_value("remove_job_files");
+my $positive_controls     = $config->get_value("positive_controls");
+my $discord_read_trim     = $config->get_value("discord_read_trim");
+my %chromosomes           = $config->get_hash("chromosomes");
+my $mt_chromosome         = $config->get_value("mt_chromosome");
+my $num_blat_sequences    = $config->get_value("num_blat_sequences");
+my $blat_bin              = $config->get_value("blat_bin");
+my $percident_threshold   = $config->get_value("percent_identity_threshold");
+my $dna_concordant_len    = $config->get_value("dna_concordant_length");
+
+my $cdna_fasta_fai        = $cdna_fasta.".fai";
+
+my $mailto;
+if ($config->has_value("mailto"))
+{
+	$mailto = $config->get_value("mailto");
+}
+
+my $status = "failure";
+sub mailme
+{
+	return if not defined $mailto;
+
+	my $text = "Fusion analysis of library $library_name finished with status $status";
+
+	print "Attempting to mail $mailto the result\n";
+
+	system "echo '$text' | mail -s '[AUTO] $text' $mailto";
+}
+
+my $main_pid = $$;
+END
+{
+	my $retcode = $?;
+	if (defined $main_pid and $$ == $main_pid)
+	{
+		mailme();
+	}
+	$? = $retcode;
+}
+
+sub verify_file_exists
+{
+	my $filename = shift;
+	
+	if (not -e $filename)
+	{
+		die "Error: Required file $filename does not exist\n";
+	}
+}
+
+sub verify_directory_exists
+{
+	my $filename = shift;
+	
+	if (not -e $filename)
+	{
+		die "Error: Required directory $filename does not exist\n";
+	}
+}
+
+# Ensure required directories exist
+verify_directory_exists($scripts_directory);
+
+# Script and binary paths
+my $retreive_fastq_script = "$scripts_directory/retreive_fastq.pl";
+my $alignjob_script = "$scripts_directory/alignjob.pl";
+my $read_stats_script = "$scripts_directory/read_stats.pl";
+my $expression_script = "$scripts_directory/calculate_expression_simple.pl";
+my $split_fastq_script = "$scripts_directory/split_fastq.pl";
+my $get_align_regions_script = "$scripts_directory/get_align_regions.pl";
+my $merge_read_stats_script = "$scripts_directory/merge_read_stats.pl";
+my $merge_cov_samples_script = "$scripts_directory/merge_cov_samples.pl";
+my $merge_expression_script = "$scripts_directory/merge_expression.pl";
+my $merge_clusters_script = "$scripts_directory/merge_clusters.pl";
+my $clustermatepairs_bin = "$tools_directory/clustermatepairs";
+my $segregate_mitochondrial_script = "$scripts_directory/segregate_mitochondrial.pl";
+my $select_fusion_clusters_script = "$scripts_directory/select_fusion_clusters.pl";
+my $prep_local_alignment_seqs_script = "$scripts_directory/prep_local_alignment_seqs.pl";
+my $filter_column_script = "$scripts_directory/filter_column.pl";
+my $remove_duplicates_script = "$scripts_directory/remove_duplicates.pl";
+my $setcover_bin = "$tools_directory/setcover";
+my $localalign_bin = "$tools_directory/localalign";
+my $initsplitalign_bin = "$tools_directory/initsplitalign";
+my $dosplitalign_bin = "$tools_directory/dosplitalign";
+my $evalsplitalign_bin = "$tools_directory/evalsplitalign";
+my $calc_span_stats_script = "$scripts_directory/calc_span_stats.pl";
+my $create_read_fasta_script = "$scripts_directory/create_read_fasta.pl";
+my $make_fasta_script = "$scripts_directory/make_fasta.pl";
+my $split_fasta_script = "$scripts_directory/split_fasta.pl";
+my $annotate_fusions_script = "$scripts_directory/annotate_fusions.pl";
+my $filter_script = "$scripts_directory/filter.pl";
+my $coallate_fusions_script = "$scripts_directory/coallate_fusions.pl";
+my $evaluate_fraglength_rscript = "$rscript_bin ".$scripts_directory."/evaluate_fraglength_mean.R";
+my $evaluate_split_rscript = "$rscript_bin ".$scripts_directory."/evaluate_split.R";
+my $adaboost_rscript = "$rscript_bin ".$scripts_directory."/run_adaboost.R";
+
+mkdir $output_directory if not -e $output_directory;
+
+my $job_directory = $output_directory."/jobs";
+my $log_directory = $output_directory."/log";
+my $log_prefix = $log_directory."/defuse";
+
+mkdir $log_directory if not -e $log_directory;
+mkdir $job_directory if not -e $job_directory;
+
+my $runner = cmdrunner->new();
+$runner->name("defuse");
+$runner->prefix($log_prefix);
+$runner->maxparallel($max_parallel);
+$runner->submitter($submitter_type);
+$runner->jobmem(3000000000);
+
+# Fastq files and prefix for index and name map
+my $reads_prefix = $output_directory."/reads";
+my $reads_end_1_fastq = $reads_prefix.".1.fastq";
+my $reads_end_2_fastq = $reads_prefix.".2.fastq";
+my $reads_index_filename = $reads_prefix.".fqi";
+my $reads_names_filename = $reads_prefix.".names";
+my $reads_sources_filename = $reads_prefix.".sources";
+
+# Optionally retrieve fastq files
+if (defined $source_directory)
+{
+	print "Retreiving fastq files\n";
+	-d $source_directory or die "Error: Unable to find source directory $source_directory\n";
+	$source_directory = abs_path($source_directory);
+	$runner->run("$retreive_fastq_script -c $config_filename -d $source_directory -1 $reads_end_1_fastq -2 $reads_end_2_fastq -i $reads_index_filename -n $reads_names_filename -s $reads_sources_filename -f", [], []);
+}
+
+print "Splitting fastq files\n";
+my $reads_split_prefix = $job_directory."/reads";
+my $reads_split_catalog = $output_directory."/reads.split.catalog";
+$runner->run("$split_fastq_script $reads_prefix $reads_per_job $reads_split_prefix > #>1", [$reads_end_1_fastq,$reads_end_2_fastq], [$reads_split_catalog]);
+
+# Read split catalog
+my @split_fastq_prefixes = readsplitcatalog($reads_split_catalog);
+
+# Create job info
+my @job_infos;
+foreach my $split_fastq_prefix (@split_fastq_prefixes)
+{
+	my %job_info;
+	$job_info{prefix} = $split_fastq_prefix;
+	$job_info{name} = basename($split_fastq_prefix);
+	$job_info{fastq1} = $split_fastq_prefix.".1.fastq";
+	$job_info{fastq2} = $split_fastq_prefix.".2.fastq";
+	
+	push @job_infos, \%job_info;
+}
+
+print "Discordant alignments\n";
+my @job_read_stats;
+my @job_spanlength_samples;
+my @job_splitpos_samples;
+my @job_splitmin_samples;
+my @job_expression;
+foreach my $job_info (@job_infos)
+{
+	# Names of job products
+	$job_info->{read_stats} = $job_info->{prefix}.".concordant.read.stats";
+	$job_info->{spanlength_samples} = $job_info->{prefix}.".spanlength.samples";
+	$job_info->{splitpos_samples} = $job_info->{prefix}.".splitpos.samples";
+	$job_info->{splitmin_samples} = $job_info->{prefix}.".splitmin.samples";
+	$job_info->{expression} = $job_info->{prefix}.".expression.txt";
+	$job_info->{cdna_pair_sam} = $job_info->{prefix}.".cdna.pair.sam";
+	$job_info->{improper_sam} = $job_info->{prefix}.".improper.sam";
+	$job_info->{spanning_filelist} = $job_info->{prefix}.".spanning.filelist";
+	
+	my $job_cmd = $alignjob_script." ";
+	$job_cmd .= "-c ".$config_filename." ";
+	$job_cmd .= "-j ".$job_info->{name}." ";
+	$job_cmd .= "-l ".$joblocal_directory." ";
+	$job_cmd .= "-o ".$output_directory." ";
+	$job_cmd .= "-n ".$library_name." ";
+	$job_cmd .= "-p ".$job_info->{prefix}." ";
+	
+	my @job_products;
+	push @job_products, $job_info->{read_stats};
+	push @job_products, $job_info->{spanlength_samples};
+	push @job_products, $job_info->{splitpos_samples};
+	push @job_products, $job_info->{splitmin_samples};
+	push @job_products, $job_info->{expression};
+	push @job_products, $job_info->{cdna_pair_sam};
+	push @job_products, $job_info->{improper_sam};
+	push @job_products, $job_info->{spanning_filelist};
+	
+	$runner->padd("$job_cmd", [$job_info->{fastq1}, $job_info->{fastq2}], [@job_products]); 
+	
+	push @job_read_stats, $job_info->{read_stats};
+	push @job_spanlength_samples, $job_info->{spanlength_samples};
+	push @job_splitpos_samples, $job_info->{splitpos_samples};
+	push @job_splitmin_samples, $job_info->{splitmin_samples};
+	push @job_expression, $job_info->{expression};
+}
+$runner->prun();
+
+# Merge read stats and expression
+my $read_stats = $output_directory."/concordant.read.stats";
+my $spanlength_cov = $output_directory."/spanlength.cov";
+my $splitpos_cov = $output_directory."/splitpos.cov";
+my $splitmin_cov = $output_directory."/splitmin.cov";
+my $expression = $output_directory."/expression.txt";
+$runner->run("$merge_read_stats_script #<A > #>1", [@job_read_stats], [$read_stats]);
+$runner->run("$merge_cov_samples_script #<A > #>1", [@job_spanlength_samples], [$spanlength_cov]);
+$runner->run("$merge_cov_samples_script #<A > #>1", [@job_splitpos_samples], [$splitpos_cov]);
+$runner->run("$merge_cov_samples_script #<A > #>1", [@job_splitmin_samples], [$splitmin_cov]);
+$runner->run("$merge_expression_script #<A > #>1", [@job_expression], [$expression]);
+
+# Read in the read stats
+my %read_stat_values;
+parsers::get_stats($read_stats, \%read_stat_values);
+
+my $read_length_min = $read_stat_values{"readlength_min"};
+my $read_length_max = $read_stat_values{"readlength_max"};
+my $fragment_mean = $read_stat_values{"fraglength_mean"};
+my $fragment_stddev = $read_stat_values{"fraglength_stddev"};
+my $fragment_max = int($fragment_mean + 3 * $fragment_stddev);
+
+print "Read Stats\n";
+print "\tFragment mean $fragment_mean stddev $fragment_stddev\n";
+print "\tRead length min $read_length_min max $read_length_max\n";
+
+if ($fragment_mean / $discord_read_trim < 3)
+{
+	my $suggested_discord_read_trim = int($fragment_mean / 3);
+	if ($suggested_discord_read_trim < 25)
+	{
+		print "WARNING: cdna fragments too short, deFuse may produce poor results\n";
+	}
+	else
+	{
+		print "WARNING: discord_read_trim likely set too high, should be at most $suggested_discord_read_trim\n";
+	}
+}
+
+# Read divided spanning alignment lists
+my %spanning_filenames;
+foreach my $job_info (@job_infos)
+{
+	open SFL, $job_info->{spanning_filelist} or die;
+	while (<SFL>)
+	{
+		chomp;
+		my ($chr1,$chr2,$filename) = split /\t/;
+		push @{$spanning_filenames{$chr1}{$chr2}}, $filename;
+	}
+	close SFL;
+}
+
+print "Generating discordant alignment clusters\n";
+my @chr_cluster_filenames;
+foreach my $chr1 (keys %spanning_filenames)
+{
+	foreach my $chr2 (keys %{$spanning_filenames{$chr1}})
+	{
+		my $chr_cluster_filename = $output_directory."/clusters.".$chr1."-".$chr2;
+		$runner->padd("cat #<A | $clustermatepairs_bin -m $span_count_threshold -p $clustering_precision -u $fragment_mean -s $fragment_stddev -a - -c #>1", [@{$spanning_filenames{$chr1}{$chr2}}], [$chr_cluster_filename]);
+		push @chr_cluster_filenames, $chr_cluster_filename;
+	}
+}
+$runner->prun();
+my $clusters_all = $output_directory."/clusters.all";
+$runner->run("$merge_clusters_script #<A > #>1", [@chr_cluster_filenames], [$clusters_all]);
+
+print "Remove mitochondrial-genomic clusters\n";
+my $clusters = $output_directory."/clusters";
+$runner->run("$segregate_mitochondrial_script $gene_models $mt_chromosome < #<1 > #>1", [$clusters_all], [$clusters]);
+
+print "Generating maximum parsimony solution\n";
+my $clusters_sc_all = $output_directory."/clusters.sc.all";
+$runner->jobmem(10000000000);
+$runner->run("$setcover_bin -m $span_count_threshold -c #<1 -o #>1", [$clusters], [$clusters_sc_all]);
+$runner->jobmem(3000000000);
+
+print "Selecting fusion clusters\n";
+my $clusters_sc_unfilt = $output_directory."/clusters.sc.unfilt";
+$runner->run("$select_fusion_clusters_script $gene_models < #<1 > #>1", [$clusters_sc_all], [$clusters_sc_unfilt]);
+
+print "Preparing sequences for local realignment\n";
+my $clusters_sc_local_seq = $output_directory."/clusters.sc.local.seq";
+$runner->run("$prep_local_alignment_seqs_script -r $reference_fasta -g $gene_models -c #<1 -s $dna_concordant_len > #>1", [$clusters_sc_unfilt], [$clusters_sc_local_seq]);
+
+print "Performing local realignment\n";
+my $clusters_sc_local_align = $output_directory."/clusters.sc.local.align";
+$runner->run("$localalign_bin -m 10 -x -5 -g -5 -t 0.8 < #<1 > #>1", [$clusters_sc_local_seq], [$clusters_sc_local_align]);
+
+print "Filtering concordant clusters\n";
+my $clusters_sc = $output_directory."/clusters.sc";
+$runner->run("cat #<1 | $filter_column_script #<2 0 1 | $remove_duplicates_script $span_count_threshold > #>1", [$clusters_sc_unfilt,$clusters_sc_local_align], [$clusters_sc]);
+
+print "Generating spanning alignment regions file\n";
+my $clusters_sc_regions = $output_directory."/clusters.sc.regions";
+$runner->run("$get_align_regions_script < #<1 > #>1", [$clusters_sc], [$clusters_sc_regions]);
+
+print "Initializing split read alignments\n";
+my $splitreads_refseqs = $output_directory."/splitreads.refseqs";
+my $splitreads_materegions = $output_directory."/splitreads.materegions";
+$runner->run("$initsplitalign_bin -i #<1 -r #>1 -m #>2 -n $read_length_min -x $read_length_max -u $fragment_mean -s $fragment_stddev -e $cdna_regions -f $reference_fasta", [$clusters_sc_regions], [$splitreads_refseqs,$splitreads_materegions]);
+
+print "Calculating split read alignments\n";
+my @job_splitreads_alignments;
+foreach my $job_info (@job_infos)
+{
+	$job_info->{splitalign} = $job_info->{prefix}.".splitreads.alignments";
+	$runner->padd("$dosplitalign_bin -1 #<1 -2 #<2 -r #<3 -m #<4 -a #<5 -s #>1", [$job_info->{fastq1},$job_info->{fastq2},$splitreads_refseqs,$splitreads_materegions,$job_info->{improper_sam}], [$job_info->{splitalign}]);
+	push @job_splitreads_alignments, $job_info->{splitalign};
+}
+$runner->prun();
+my $splitreads_alignments = $output_directory."/splitreads.alignments";
+$runner->run("cat #<A > #>1", [@job_splitreads_alignments], [$splitreads_alignments]);
+
+print "Evaluating split reads\n";
+my $splitreads_break = $output_directory."/splitreads.break";
+my $splitreads_seq = $output_directory."/splitreads.seq";
+$runner->run("$evalsplitalign_bin -r #<1 -a #<2 -b #>1 -q #>2", [$splitreads_refseqs,$splitreads_alignments], [$splitreads_break,$splitreads_seq]);
+
+print "Calculating spanning stats\n";
+my $splitreads_span_stats = $output_directory."/splitreads.span.stats";
+$runner->padd("$calc_span_stats_script -c #<1 -b #<2 -s #<3 > #>1", [$clusters_sc,$splitreads_break,$splitreads_seq], [$splitreads_span_stats]);
+$runner->prun();
+
+print "Calculating spanning p-values\n";
+my $splitreads_span_pval = $output_directory."/splitreads.span.pval";
+$runner->padd("$evaluate_fraglength_rscript #<1 #<2 $discord_read_trim #<3 #>1", [$read_stats,$spanlength_cov,$splitreads_span_stats], [$splitreads_span_pval]);
+$runner->prun();
+
+print "Calculating split read pvalues\n";
+my $splitreads_split_pval = $output_directory."/splitreads.split.pval";
+$runner->run("$evaluate_split_rscript #<1 #<2 #<3 #>1", [$splitpos_cov,$splitmin_cov,$splitreads_seq], [$splitreads_split_pval]);
+
+print "Creating fastas\n";
+my $fusionreads_fasta = $output_directory."/fusionreads.fa";
+my $breakpoints_fasta = $output_directory."/breakpoints.fa";
+$runner->run("$create_read_fasta_script #<1 $reads_prefix > #>1", [$clusters_sc], [$fusionreads_fasta]);
+$runner->run("cut -f1,2 #<1 | $make_fasta_script > #>1", [$splitreads_seq], [$breakpoints_fasta]);
+
+print "Splitting fastas\n";
+my $fusionreads_split_prefix = $job_directory."/fusionreads";
+my $fusionreads_split_catalog = $output_directory."/fusionreads.split.catalog";
+my $breakpoints_split_prefix = $job_directory."/breakpoints";
+my $breakpoints_split_catalog = $output_directory."/breakpoints.split.catalog";
+$runner->run("$split_fasta_script #<1 $num_blat_sequences $fusionreads_split_prefix > #>1", [$fusionreads_fasta], [$fusionreads_split_catalog]);
+$runner->run("$split_fasta_script #<1 $num_blat_sequences $breakpoints_split_prefix > #>1", [$breakpoints_fasta], [$breakpoints_split_catalog]);
+my @fusionreads_split_fastas = readsplitcatalog($fusionreads_split_catalog);
+my @breakpoints_split_fastas = readsplitcatalog($breakpoints_split_catalog);
+
+print "Blat alignments\n";
+my $fusionreads_genome_psl = $output_directory."/fusionreads.genome.psl";
+my $fusionreads_cdna_psl = $output_directory."/fusionreads.cdna.psl";
+my $fusionreads_rrna_psl = $output_directory."/fusionreads.rrna.psl";
+my $breakpoints_genome_psl = $output_directory."/breakpoints.genome.psl";
+my $breakpoints_genome_nointron_psl = $output_directory."/breakpoints.genome.nointron.psl";
+my $breakpoints_cdna_psl = $output_directory."/breakpoints.cdna.psl";
+my $breakpoints_est_psl = $output_directory."/breakpoints.est.psl";
+my $breakpoints_exons_psl = $output_directory."/breakpoints.exons.psl";
+my $breakpoints_cds_psl = $output_directory."/breakpoints.cds.psl";
+
+my @blat_jobs;
+push @blat_jobs, [$fusionreads_fasta, $fusionreads_genome_psl, \@fusionreads_split_fastas, $genome_fasta, "", "genome"];
+push @blat_jobs, [$fusionreads_fasta, $fusionreads_cdna_psl, \@fusionreads_split_fastas, $cdna_fasta, "", "cdna"];
+push @blat_jobs, [$fusionreads_fasta, $fusionreads_rrna_psl, \@fusionreads_split_fastas, $rrna_fasta, "", "rrna"];
+push @blat_jobs, [$breakpoints_fasta, $breakpoints_genome_psl, \@breakpoints_split_fastas, $genome_fasta, "", "genome"];
+push @blat_jobs, [$breakpoints_fasta, $breakpoints_genome_nointron_psl, \@breakpoints_split_fastas, $genome_fasta, "-maxIntron=0", "genome.nointron"];
+push @blat_jobs, [$breakpoints_fasta, $breakpoints_cdna_psl, \@breakpoints_split_fastas, $cdna_fasta, "", "cdna"];
+push @blat_jobs, [$breakpoints_fasta, $breakpoints_est_psl, \@breakpoints_split_fastas, $est_fasta, "", "est"];
+push @blat_jobs, [$breakpoints_fasta, $breakpoints_exons_psl, \@breakpoints_split_fastas, $exons_fasta, "", "exons"];
+push @blat_jobs, [$breakpoints_fasta, $breakpoints_cds_psl, \@breakpoints_split_fastas, $cds_fasta, "", "cds"];
+
+doblatjobs(@blat_jobs);
+
+print "Annotating fusions\n";
+my $annotations_filename = $output_directory."/annotations";
+$runner->run("$annotate_fusions_script -c $config_filename -o $output_directory -n $library_name > #>1", [$splitreads_span_pval,$splitreads_break,$splitreads_seq,$clusters_sc], [$annotations_filename]);
+
+print "Coallating fusions\n";
+my $results_filename = $output_directory."/results.tsv";
+$runner->run("$coallate_fusions_script -c $config_filename -o $output_directory -l #<1 > #>1", [$annotations_filename], [$results_filename]);
+
+print "Running adaboost classifier\n";
+my $results_classify = $output_directory."/results.classify.tsv";
+$runner->run("$adaboost_rscript $positive_controls #<1 #>1", [$results_filename], [$results_classify]);
+
+print "Filtering fusions\n";
+my $filtered_results_filename = $output_directory."/results.filtered.tsv";
+$runner->run("$filter_script probability '> $probability_threshold' < #<1 > #>1", [$results_classify], [$filtered_results_filename]);
+
+print "Success\n";
+
+# Remove job files
+if (lc($remove_job_files) eq "yes")
+{
+	foreach my $split_fastq_prefix (@split_fastq_prefixes)
+	{
+		unlink $split_fastq_prefix.".1.fastq";
+		unlink $split_fastq_prefix.".2.fastq";
+		unlink $split_fastq_prefix.".candidate.reads.alignments";
+		unlink $split_fastq_prefix.".candidate.reads";
+	}
+}
+
+$status = "success";
+
+sub readsplitcatalog
+{
+	my $split_catalog = shift;
+	my @split_prefixes;
+
+	open SC, $split_catalog or die "Error: Unable to open $split_catalog: $!\n";
+	while (<SC>)
+	{
+		chomp;
+		my @fields = split /\t/;
+
+		push @split_prefixes, $fields[0];
+	}
+	close SC;
+
+	return @split_prefixes;
+}
+
+sub doblatjobs
+{
+	my @merge_jobs;
+	foreach my $blat_job (@_)
+	{
+		my @blat_job_info = @{$blat_job};
+		
+		my $fasta = shift @blat_job_info;
+		my $psl = shift @blat_job_info;
+		if (not cmdrunner::uptodate([$fasta], [$psl]))
+		{
+			my @split_psls = padd_doblatalignments(@blat_job_info);
+			push @merge_jobs, [\@split_psls, $psl];
+		}
+	}
+	$runner->prun();
+	
+	foreach my $merge_job (@merge_jobs)
+	{
+		$runner->padd("cat #<A > #>1", $merge_job->[0], [$merge_job->[1]]);
+	}
+	$runner->prun();
+}
+
+sub padd_doblatalignments
+{
+	my $split_fastas_ref = shift;
+	my $reference = shift;
+	my $blat_parameters = shift;
+	my $align_name = shift;
+	
+	if ($reference eq $genome_fasta)
+	{
+		return padd_doblatalignments_genome($split_fastas_ref, $blat_parameters, $align_name);
+	}
+	elsif ($reference eq $est_fasta)
+	{
+		return padd_doblatalignments_est($split_fastas_ref, $blat_parameters, $align_name);
+	}
+	
+	my @output_psls;
+	foreach my $split_fasta (@{$split_fastas_ref})
+	{
+		my $output_psl = $split_fasta.".".$align_name.".psl";
+		$runner->padd("$blat_bin -noHead $blat_parameters $reference.2bit #<1 #>1", [$split_fasta], [$output_psl]);
+		push @output_psls, $output_psl;
+	}
+	
+	return @output_psls;
+}
+
+sub padd_doblatalignments_genome
+{
+	my $split_fastas_ref = shift;
+	my $blat_parameters = shift;
+	my $align_name = shift;
+	
+	my @output_psls;
+	foreach my $chromosome (keys %chromosomes)
+	{
+		my $chromosome_fasta = $chromosome_prefix.".".$chromosome.".fa";
+		push @output_psls, padd_doblatalignments($split_fastas_ref, $chromosome_fasta, $blat_parameters, $align_name.".".$chromosome);
+	}
+	
+	return @output_psls;
+}
+
+sub padd_doblatalignments_est
+{
+	my $split_fastas_ref = shift;
+	my $blat_parameters = shift;
+	my $align_name = shift;
+	
+	my @output_psls;
+	foreach my $est_split_fasta_index (0..$#est_split_fastas)
+	{
+		my $est_split_fasta = $est_split_fastas[$est_split_fasta_index];
+		push @output_psls, padd_doblatalignments($split_fastas_ref, $est_split_fasta, $blat_parameters, $align_name.".".$est_split_fasta_index);
+	}
+	
+	return @output_psls;
+}
+
+
+
